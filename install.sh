@@ -82,14 +82,13 @@ mkdir -p "$HOME/.procode"
 CONFIG="$HOME/.procode/config.json"
 if [ ! -f "$CONFIG" ]; then
   echo
-  echo -e "${DIM}API keys are stored in ~/.procode/config.json${NC}"
-  echo -e "${DIM}You can also set PROCODE_OR_KEY and PROCODE_NV_KEY env vars.${NC}"
-  echo -e "${DIM}Press Enter to skip (DeepSeek V4 Pro will use env vars).${NC}"
+  echo -e "${DIM}API keys go in ~/.procode/config.json or env vars.${NC}"
+  echo -e "${DIM}Press Enter to skip (models use env vars).${NC}"
   echo
-  printf "${CYAN}OpenRouter key${NC} (for Sol Pro): "
-  read -r OR_KEY
-  printf "${CYAN}NVIDIA key${NC} (for DS V4 Pro): "
+  printf "${CYAN}NVIDIA key${NC} (free, for DS V4 Pro etc): "
   read -r NV_KEY
+  printf "${CYAN}OpenRouter key${NC} (free tier, for Nem Reason): "
+  read -r OR_KEY
   if [ -n "$OR_KEY" ] || [ -n "$NV_KEY" ]; then
     cat > "$CONFIG" <<EOF
 {
@@ -114,5 +113,5 @@ echo -e "  ${CYAN}procode${NC}          ${DIM}start interactive session${NC}"
 echo -e "  ${CYAN}procode <prompt>${NC}  ${DIM}one-shot mode${NC}"
 echo -e "  ${CYAN}procode /sh <cmd>${NC} ${DIM}run a shell command${NC}"
 echo
-echo -e "  ${DIM}Add \$5+ credits for Sol Pro:${NC} ${CYAN}https://openrouter.ai/credits${NC}"
+echo -e "  ${DIM}All models free — no payment needed${NC}"
 echo -e "  ${DIM}Open a new terminal, or run:${NC} source $RC"
