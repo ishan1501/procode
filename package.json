@@ -1,0 +1,28 @@
+{
+  "name": "procode",
+  "version": "4.0.0",
+  "description": "Free AI coding agent in your terminal",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "procode": "dist/index.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.tsx --outdir dist --target bun",
+    "start": "bun run src/index.tsx",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.20",
+    "ai": "^7.0.37",
+    "ink": "^7.1.1",
+    "react": "^19.2.8",
+    "react-devtools-core": "^7.0.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.2.17",
+    "typescript": "^7.0.2"
+  }
+}
