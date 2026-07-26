@@ -53,7 +53,7 @@ echo -e "${BOLD}Downloading ProCode...${NC}"
 if [ -n "$PROCODE_DEV" ]; then
   cp "$HOME/bin/procode" "$INSTALL_DIR/procode"
 else
-  curl -fsSL "https://raw.githubusercontent.com/ishan/procode/main/procode" \
+  curl -fsSL "https://raw.githubusercontent.com/ishan1501/procode/main/procode" \
     -o "$INSTALL_DIR/procode" 2>/dev/null || {
     echo "Download failed. Trying mirror..."
     curl -fsSL "https://procode.ai/procode" -o "$INSTALL_DIR/procode"
