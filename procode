@@ -327,8 +327,6 @@ def cmd_models():
     print(f"\n  {D(f'{len(PROVIDERS_RAW)} routes • {len(seen)} models • 6 tiers')}\n")
 
 def main():
-    os.system('clear')
-
     cwd = os.getcwd()
     sessions = load_sessions()
     active_name = sessions.get("active")
@@ -367,6 +365,7 @@ def main():
                 for s in save_blocks(f): print(f" {G('✓')} {os.path.basename(s)}")
         return
 
+    os.system('clear')
     bl = budget_line()
     print(header_line(bl))
     print()
