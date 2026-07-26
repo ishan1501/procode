@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+import sys, os, json, subprocess, re, readline, urllib.request, time, textwrap, shutil
+from datetime import datetime
+from pathlib import Path
+from openai import OpenAI
+
+DATA_DIR = os.path.expanduser("~/.procode")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+
+def _load_config():
+    c = {}
+    try:
+        with open(CONFIG_PATH) as f: c = json.load(f)
+    except: pass
+    # Env vars override config file
+    for k in ("PROCODE_OR_KEY","PROCODE_NV_KEY","PROCODE_OR_BASE","PROCODE_NV_BASE"):
+        if os.environ.get(k): c[k.lower().replace("procode_","")] = os.environ[k]
+    return c
+
+_cfg = _load_config()
+OR_KEY = _cfg.get("or_key", "")
+NV_KEY = _cfg.get("nv_key", "")
+OR_BASE = _cfg.get("or_base", "https://openrouter.ai/api/v1")
+NV_BASE = _cfg.get("nv_base", "https://integrate.api.nvidia.com/v1")
+
+PROVIDERS_RAW = [
+    ("Sol Pro OpenAI",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI"],"allow_fallbacks":False}}),
+    ("Sol Pro Azure",    OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure"],"allow_fallbacks":False}}),
+    ("Sol Pro AzureEU",  OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure","Azure (EU)"]}}),
+    ("Sol Pro Balanced", OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI","Azure"]}}),
+    ("Sol Pro Nitro",    OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {}),
+    ("Sol Pro Exacto",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {}),
+    ("Sol Pro ONitro",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI"]}}),
+    ("Sol Pro ANitro",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure"]}}),
+    ("DS V4 Pro 1", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}),
+    ("DS V4 Pro 2", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}),
+    ("DS V4 Pro 3", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}),
+    ("DS V4 Flash", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-flash", 16384, {}),
+]
+CLIENTS = {}
+for n, k, b, _, _, _ in PROVIDERS_RAW:
+    try: CLIENTS[n] = OpenAI(api_key=k, base_url=b)
+    except: pass
+
+G = lambda t: f"\033[38;5;46m{t}\033[0m"
+Y = lambda t: f"\033[38;5;227m{t}\033[0m"
+C = lambda t: f"\033[38;5;87m{t}\033[0m"
+BO = lambda t: f"\033[1m{t}\033[0m"
+D = lambda t: f"\033[2m{t}\033[0m"
+R = lambda t: f"\033[38;5;196m{t}\033[0m"
+M = lambda t: f"\033[38;5;201m{t}\033[0m"
+
+SYSTEM = "You are ProCode. Write working code with no comments. Always output files inside ```code blocks with filename on first line as comment (# filename.py). Use /sh to run commands."
+
+_usage = 0.22
+_last_budget_check = 0
+DATA_DIR = os.path.expanduser("~/.procode")
+os.makedirs(DATA_DIR, exist_ok=True)
+SESSION_FILE = os.path.join(DATA_DIR, "session.json")
+HIST_FILE = os.path.join(DATA_DIR, "history")
+PREFS_FILE = os.path.join(DATA_DIR, "prefs.json")
+
+def refresh_budget():
+    global _usage, _last_budget_check
+    if time.time() - _last_budget_check < 30: return
+    try:
+        req = urllib.request.Request(f"{OR_BASE}/auth/key", headers={"Authorization":f"Bearer {OR_KEY}"})
+        d = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        _usage = d.get("data",{}).get("usage", _usage)
+        _last_budget_check = time.time()
+    except: pass
+
+def budget_line(w=16):
+    refresh_budget()
+    p = max(0, min(1, 1 - _usage / 1.0))
+    f = int(p * w)
+    bar = "━" * f + "─" * (w - f)
+    c = G if p > 0.6 else Y if p > 0.3 else lambda t: t
+    return f"Budget {c(bar)} {G(f'{p*100:.0f}%')}"
+
+def call_api(name, msgs, max_tok=4096):
+    c = CLIENTS.get(name)
+    if not c: return None
+    p = next(x for x in PROVIDERS_RAW if x[0] == name)
+    kw = {"model": p[3], "messages": msgs, "max_tokens": min(max_tok, p[4]), "stream": True,
+          "extra_headers": {"HTTP-Referer":"https://procode.ai","X-Title":"ProCode"}}
+    if p[5]: kw["extra_body"] = p[5]
+    try: return c.chat.completions.create(**kw, timeout=3 if name.startswith("Sol") else 30)
+    except: return None
+
+def send(msgs):
+    for p in PROVIDERS_RAW:
+        r = call_api(p[0], msgs)
+        if r: return r, p[0]
+    return None, None
+
+def stream_out(resp):
+    t = ""
+    for c in resp:
+        if c.choices and c.choices[0].delta and c.choices[0].delta.content:
+            s = c.choices[0].delta.content; print(s, end="", flush=True); t += s
+    return t
+
+def run_sh(cmd):
+    try: r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30); return (r.stdout + r.stderr)[:5000]
+    except: return ""
+
+def fuzzy_files(q, limit=10):
+    ql = q.lower()
+    res = []
+    for root, dirs, files in os.walk("."):
+        if ".git" in root or "__pycache__" in root or "node_modules" in root: continue
+        for f in files:
+            fp = os.path.join(root, f)
+            if ql in fp.lower() or ql in f.lower():
+                res.append((fp, os.path.getsize(fp)))
+    res.sort(key=lambda x: x[1])
+    return [r[0][2:] if r[0].startswith("./") else r[0] for r in res[:limit]]
+
+def file_content(path):
+    try: return open(os.path.expanduser(path)).read()
+    except: return None
+
+def search_grep(pattern, path="."):
+    try:
+        r = subprocess.run(f"rg -l '{pattern}' {path} 2>/dev/null || grep -rl '{pattern}' {path} 2>/dev/null", shell=True, capture_output=True, text=True, timeout=15)
+        return [f for f in r.stdout.strip().split("\n") if f][:20]
+    except: return []
+
+def save_blocks(text, cwd="."):
+    saved = []
+    for lang, code in re.findall(r'```(\w*)\n(.*?)```', text, re.DOTALL):
+        code = code.strip()
+        if not code: continue
+        fn = None
+        for l in code.split("\n")[:3]:
+            m = re.match(r'^(?:#|//|--)\s*(.+)', l)
+            if m: fn = m.group(1).strip(); break
+        if not fn:
+            m = re.search(r'filename[=:]\s*"?([^"\s]+)"?', text)
+            fn = m.group(1) if m else f"out_{datetime.now().strftime('%H%M%S')}.{lang or 'txt'}"
+        p = os.path.expanduser(fn)
+        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+        with open(p,"w") as f: f.write(code)
+        saved.append(p)
+    if not saved:
+        lines = text.strip().split("\n")
+        if lines:
+            m = re.match(r'^(?:#|//|--)\s*(\S+\.\w+)', lines[0])
+            if m:
+                p = os.path.expanduser(m.group(1))
+                with open(p,"w") as f: f.write("\n".join(lines[1:]))
+                saved.append(p)
+    return saved
+
+def load_sessions():
+    try:
+        with open(SESSION_FILE) as f: return json.load(f)
+    except: return {"sessions": [], "active": None}
+
+def save_sessions(data):
+    with open(SESSION_FILE, "w") as f: json.dump(data, f)
+
+def load_prefs():
+    try:
+        with open(PREFS_FILE) as f: return json.load(f)
+    except: return {}
+
+def save_prefs(p):
+    with open(PREFS_FILE, "w") as f: json.dump(p, f)
+
+def colored_diff(old, new):
+    if old == new: return new
+    o, n = old.split("\n"), new.split("\n")
+    res = []
+    import difflib
+    for line in difflib.unified_diff(o, n, lineterm=""):
+        if line.startswith("+"): res.append(G(line))
+        elif line.startswith("-"): res.append(R(line))
+        elif line.startswith("@@"): res.append(C(line))
+        else: res.append(line)
+    return "\n".join(res)
+
+def print_wrap(text, indent=0):
+    width = shutil.get_terminal_size().columns - indent - 1
+    for line in text.split("\n"):
+        if line == "":
+            print()
+        else:
+            wrapped = textwrap.fill(line, width=width)
+            for wl in wrapped.split("\n"):
+                print(" " * indent + wl)
+
+# ── Edit command ─────────────────────────────────────────────
+def cmd_edit(args):
+    parts = args.split(None, 1)
+    if not parts:
+        print(f" {R('✗')} Usage: /edit <file> <new content> or /edit <file> (opens $EDITOR)")
+        return
+    fpath = os.path.expanduser(parts[0])
+    if not os.path.exists(fpath):
+        # Try creating new file
+        content = parts[1] if len(parts) > 1 else ""
+        with open(fpath, "w") as f: f.write(content)
+        print(f" {G('✓')} Created {fpath}")
+        return
+    old = open(fpath).read()
+    if len(parts) > 1:
+        new = parts[1]
+    else:
+        print(f" {Y('?')} No content provided. Use /write to create new files.")
+        return
+    with open(fpath, "w") as f: f.write(new)
+    print(f" {G('✓')} Updated {fpath}")
+
+def cmd_write(args):
+    parts = args.split(None, 1)
+    if not parts:
+        print(f" {R('✗')} Usage: /write <file> <content>")
+        return
+    fpath = os.path.expanduser(parts[0])
+    content = parts[1] if len(parts) > 1 else ""
+    os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+    with open(fpath, "w") as f: f.write(content)
+    print(f" {G('✓')} Wrote {fpath}")
+
+def cmd_undo(msgs):
+    if len(msgs) < 2:
+        print(f" {Y('-')} Nothing to undo")
+        return
+    msgs.pop()
+    msgs.pop()
+    print(f" {G('✓')} Undone")
+
+def cmd_export(msgs):
+    path = os.path.join(DATA_DIR, f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
+    with open(path, "w") as f:
+        f.write("# ProCode Session Export\n\n")
+        for m in msgs:
+            f.write(f"**{m['role']}**:\n{m['content']}\n\n")
+    print(f" {G('✓')} Exported to {path}")
+
+def cmd_help():
+    help_text = f""" {C('ProCode')} {D('- AI coding agent in your terminal')}
+
+ {BO('Commands')}
+  /help         {D('Show this help')}
+  /clear        {D('Clear screen')}
+  /read <file>  {D('Read a file')}
+  /write <f>    {D('Write content to file')}
+  /edit <f>     {D('Edit file with new content')}
+  /grep <q>     {D('Search file contents')}
+  /glob <p>     {D('Find files by pattern')}
+  /sh <cmd>     {D('Run shell command')}
+  /undo         {D('Undo last exchange')}
+  /export       {D('Export session to file')}
+  /budget       {D('Show credit usage')}
+  /models       {D('List available models')}
+  /sessions     {D('List saved sessions')}
+  /save <name>  {D('Save current session')}
+  /load <name>  {D('Load a saved session')}
+  exit / quit   {D('Exit ProCode')}
+
+ {BO('Features')}
+  @<file>       {D('Attach file to message (fuzzy search)')}
+  !<command>    {D('Run shell command inline')}"""
+    print(help_text)
+
+def cmd_models():
+    print(f"\n {BO('Available Models')}\n")
+    seen = set()
+    for n, k, b, m, mt, _ in PROVIDERS_RAW:
+        prefix = "Sol" if n.startswith("Sol") else "DS "
+        if m not in seen:
+            print(f"  {G('●') if prefix == 'Sol' else C('●')} {n}  {D(f'({m})')}")
+            seen.add(m)
+    print(f"\n {D(f'{len(PROVIDERS_RAW)} routes across {len(seen)} models')}\n")
+
+def main():
+    cwd = os.getcwd()
+    sessions = load_sessions()
+    active_name = sessions.get("active")
+    session_list = sessions.get("sessions", {})
+
+    if active_name and active_name in session_list:
+        msgs = session_list[active_name]["msgs"]
+    else:
+        msgs = [{"role": "system", "content": f"{SYSTEM}\nCWD: {cwd}"}]
+
+    last_model = None
+    try: readline.read_history_file(HIST_FILE)
+    except: pass
+
+    cols = shutil.get_terminal_size().columns
+
+    if len(sys.argv) > 1 and sys.argv[1] != "run":
+        # Direct one-shot
+        p = " ".join(sys.argv[1:])
+        if p.startswith("/read "):
+            c = file_content(p[6:])
+            if c: print(c)
+            return
+        if p.startswith("/sh "):
+            print(run_sh(p[4:])); return
+        if p.startswith("/grep "):
+            for f in search_grep(p[6:]): print(f)
+            return
+
+    if len(sys.argv) > 1:
+        p = " ".join(sys.argv[1:]) if sys.argv[1] != "run" else " ".join(sys.argv[2:])
+        msgs.append({"role": "user", "content": p})
+        r, m = send(msgs)
+        if r:
+            f = stream_out(r); print()
+            for s in save_blocks(f): print(f" {G('✓')} {os.path.basename(s)}")
+        return
+
+    os.system('clear')
+    bl = budget_line()
+    print(f" {C('◆')} {BO('ProCode')}  {G('GPT-5.6 Sol Pro')} {D('→ DS V4 Pro')}  {D('│')}  {bl}")
+    print()
+
+    while True:
+        try: inp = input(f" {C('▸')} ").strip()
+        except: print(); break
+        if not inp: continue
+
+        if inp in ("exit", "quit", "/q"): print(); break
+
+        # Commands
+        if inp == "/clear": os.system('clear'); print(f" {C('◆')} {BO('ProCode')}  {G('GPT-5.6 Sol Pro')} {D('→ DS V4 Pro')}  {D('│')}  {budget_line()}\n"); continue
+        if inp == "/help": cmd_help(); continue
+        if inp == "/budget":
+            refresh_budget()
+            bl = budget_line()
+            print(f" {bl}")
+            continue
+        if inp == "/models": cmd_models(); continue
+        if inp == "/undo": cmd_undo(msgs); continue
+        if inp == "/export": cmd_export(msgs); continue
+        if inp.startswith("/read "):
+            c = file_content(inp[6:])
+            if c is not None:
+                print(f"\n{D('── ' + inp[6:] + ' ──')}")
+                print(f"{c}")
+            else: print(f" {R('✗')} Not found")
+            continue
+        if inp.startswith("/write "): cmd_write(inp[7:]); continue
+        if inp.startswith("/edit "): cmd_edit(inp[6:]); continue
+        if inp.startswith("/sh "): print(run_sh(inp[4:])); continue
+        if inp.startswith("/grep "):
+            for f in search_grep(inp[6:]): print(f" {D('·')} {f}")
+            continue
+        if inp.startswith("/glob "):
+            import glob as gb
+            for f in gb.glob(inp[6:], recursive=True)[:20]:
+                if os.path.isfile(f): print(f" {D('·')} {f}")
+            continue
+        if inp.startswith("/save "):
+            name = inp[6:].strip()
+            if not name: name = f"session_{len(session_list)}"
+            session_list[name] = {"msgs": msgs.copy(), "time": time.time()}
+            sessions["sessions"] = session_list
+            sessions["active"] = name
+            save_sessions(sessions)
+            print(f" {G('✓')} Saved as '{name}'")
+            continue
+        if inp.startswith("/load "):
+            name = inp[6:].strip()
+            if name in session_list:
+                msgs = session_list[name]["msgs"]
+                sessions["active"] = name
+                save_sessions(sessions)
+                print(f" {G('✓')} Loaded '{name}' ({len(msgs)} messages)")
+            else: print(f" {R('✗')} Session '{name}' not found")
+            continue
+        if inp == "/sessions":
+            if not session_list: print(f" {Y('-')} No saved sessions")
+            else:
+                for name, s in session_list.items():
+                    cnt = len(s["msgs"]); print(f" {G('\u25cf')} {name}  {D(f'({cnt} msgs)')}")
+            continue
+
+        # Handle @file attachments
+        attachment = None
+        at_match = re.search(r'@(\S+)', inp)
+        if at_match:
+            q = at_match.group(1)
+            files = fuzzy_files(q, limit=5)
+            if files:
+                attachment = files[0]
+                fc = file_content(attachment)
+                if fc:
+                    inp = inp.replace(at_match.group(0), "")
+                    inp = f"[File: {attachment}]\n```\n{fc}\n```\n{inp}"
+
+        # Handle !commands
+        if inp.startswith("!"):
+            out = run_sh(inp[1:])
+            inp = f"$ {inp[1:]}\n{out}"
+
+        # Process inline commands
+        inp_proc = re.sub(r'/read\s+(\S+)', lambda m: (
+            f"\n```\n{open(os.path.expanduser(m.group(1))).read()}\n```\n"
+            if os.path.exists(os.path.expanduser(m.group(1))) else ""
+        ), inp)
+        inp_proc = re.sub(r'/sh\s+(.*)', lambda m: f"\n$ {m.group(1)}\n{run_sh(m.group(1))}\n", inp_proc)
+
+        msgs.append({"role": "user", "content": inp_proc})
+        r, m = send(msgs)
+        if not r: continue
+        if m != last_model:
+            c = G if m.startswith("Sol") else C
+            print(f" {c(f'[{m}]')}")
+            last_model = m
+        f = stream_out(r); print()
+        msgs.append({"role": "assistant", "content": f})
+        saved = save_blocks(f)
+        if saved:
+            names = [os.path.basename(s) for s in saved]
+            print(f" {D('─')} {BO(', '.join(names))}")
+
+        # Auto-save session
+        session_list["_latest"] = {"msgs": msgs.copy(), "time": time.time()}
+        sessions["sessions"] = session_list
+        save_sessions(sessions)
+
+    try:
+        readline.write_history_file(HIST_FILE)
+        if len(msgs) > 1:
+            session_list["_latest"] = {"msgs": msgs.copy(), "time": time.time()}
+            sessions["sessions"] = session_list
+            save_sessions(sessions)
+    except: pass
+
+if __name__ == "__main__":
+    main()
