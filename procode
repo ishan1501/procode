@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, os, json, subprocess, re, readline, urllib.request, time, textwrap, shutil, glob as gb
+import sys, os, json, subprocess, re, readline, urllib.request, time, textwrap, shutil, glob as gb, threading
 from datetime import datetime
 from openai import OpenAI
 
@@ -7,7 +7,6 @@ DATA_DIR = os.path.expanduser("~/.procode")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 SESSION_FILE = os.path.join(DATA_DIR, "session.json")
 HIST_FILE = os.path.join(DATA_DIR, "history")
-
 os.makedirs(DATA_DIR, exist_ok=True)
 
 def _load_config():
@@ -15,10 +14,9 @@ def _load_config():
     try:
         with open(CONFIG_PATH) as f: c = json.load(f)
     except: pass
-    for k, v in os.environ.items():
-        kl = k.lower().replace("procode_", "")
-        if kl in ("or_key", "nv_key", "or_base", "nv_base"):
-            c[kl] = v
+    for k in ("PROCODE_OR_KEY","PROCODE_NV_KEY","PROCODE_OR_BASE","PROCODE_NV_BASE"):
+        v = os.environ.get(k)
+        if v: c[k.lower().replace("procode_","")] = v
     return c
 
 _cfg = _load_config()
@@ -27,13 +25,10 @@ NV_KEY = _cfg.get("nv_key", "")
 OR_BASE = _cfg.get("or_base", "https://openrouter.ai/api/v1")
 NV_BASE = _cfg.get("nv_base", "https://integrate.api.nvidia.com/v1")
 
+# Free model chain - no payment needed
 PROVIDERS_RAW = [
-    ("Sol OpenAI",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI"],"allow_fallbacks":False}}, 3),
-    ("Sol Azure",    OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure"],"allow_fallbacks":False}}, 3),
-    ("Sol Bal",      OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI","Azure","AWS"]}}, 3),
     ("DS V4 Pro",    NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}, 30),
-    ("DS V4 Pro B",  NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}, 30),
-    ("DS V4 Flash",  NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-flash", 16384, {}, 25),
+    ("DS V4 Pro 2",  NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}, 30),
     ("Llama4 Mav",   NV_KEY, NV_BASE, "meta/llama-4-maverick-17b-128e-instruct", 8192, {}, 25),
     ("Nemotron S49", NV_KEY, NV_BASE, "nvidia/llama-3.3-nemotron-super-49b-v1", 8192, {}, 25),
     ("Nem Reason",   OR_KEY, OR_BASE, "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", 8192, {}, 15),
@@ -41,7 +36,7 @@ PROVIDERS_RAW = [
 
 CLIENTS = {}
 for n, k, b, _, _, _, _ in PROVIDERS_RAW:
-    try: CLIENTS[n] = OpenAI(api_key=k, base_url=b)
+    try: CLIENTS[n] = OpenAI(api_key=k, base_url=b) if k else None
     except: pass
 
 G = lambda t: f"\033[38;5;46m{t}\033[0m"
@@ -54,10 +49,14 @@ M = lambda t: f"\033[38;5;201m{t}\033[0m"
 W = lambda t: f"\033[38;5;250m{t}\033[0m"
 BL = lambda t: f"\033[38;5;33m{t}\033[0m"
 
-SYSTEM = "You are ProCode. Write working code with no comments. Always output files inside ```code blocks with filename on first line as comment (# filename.py). Use /sh to run shell commands when needed."
+SYSTEM = "You are ProCode. Write working code with no comments. Output files inside ```code blocks with filename on first line as comment. Use /sh to run commands."
 
 _usage = 0.216
 _last_budget_check = 0
+_session_tokens = {"prompt": 0, "completion": 0, "total": 0}
+_spinner_active = False
+_last_response_time = 0
+_last_model_name = ""
 
 def refresh_budget():
     global _usage, _last_budget_check
@@ -77,42 +76,73 @@ def budget_line():
     f = int(p * w)
     bar = "━" * f + "─" * (w - f)
     c = G if p > 0.6 else Y if p > 0.3 else R
-    spent = f"${_usage:.3f}"
-    return f"Budget {c(bar)} {c(f'{p*100:.0f}%')} {W(spent)}"
+    return f"{c(bar)} {c(f'{p*100:.0f}%')}"
+
+def token_bar():
+    t = _session_tokens["total"]
+    if t == 0: return ""
+    kb = t / 1000
+    return f"{W(f'{kb:.1f}K')}"
+
+def header():
+    cols = shutil.get_terminal_size().columns
+    bl = budget_line()
+    tk = token_bar()
+    parts = [f" {C('\u25c6')} {B('ProCode')}", f"{G('FREE')}", f"{D('|')}  {bl}"]
+    if tk: parts.append(f"{D('|')} {tk}tok")
+    return " ".join(parts)[:cols]
 
 def call_api(name, msgs, max_tok=4096):
     c = CLIENTS.get(name)
-    if not c: return None
+    if not c: return None, 0, 0
     p = next(x for x in PROVIDERS_RAW if x[0] == name)
-    kw = {"model": p[3], "messages": msgs, "max_tokens": min(max_tok, p[4]), "stream": True,
+    kw = {"model": p[3], "messages": msgs, "max_tokens": min(max_tok, p[4]), "stream": False,
           "extra_headers": {"HTTP-Referer":"https://procode.ai","X-Title":"ProCode"}}
     if p[5]: kw["extra_body"] = p[5]
-    try: return c.chat.completions.create(**kw, timeout=p[6])
-    except: return None
+    try:
+        r = c.chat.completions.create(**kw, timeout=p[6])
+        pt = r.usage.prompt_tokens if r.usage else 0
+        ct = r.usage.completion_tokens if r.usage else 0
+        content = r.choices[0].message.content if r.choices else ""
+        return content, pt, ct
+    except: return None, 0, 0
 
 def send(msgs):
+    global _last_response_time, _last_model_name
     for p in PROVIDERS_RAW:
-        r = call_api(p[0], msgs)
-        if r: return r, p[0]
+        start = time.time()
+        content, pt, ct = call_api(p[0], msgs)
+        if content:
+            _last_response_time = time.time() - start
+            _last_model_name = p[0]
+            _session_tokens["prompt"] += pt
+            _session_tokens["completion"] += ct
+            _session_tokens["total"] += pt + ct
+            return content, p[0]
+        elif "free" in p[3] or "reasoning" in p[3].lower(): pass
     return None, None
 
-def stream_out(resp):
-    t = ""
-    for c in resp:
-        if c.choices and c.choices[0].delta and c.choices[0].delta.content:
-            s = c.choices[0].delta.content; print(s, end="", flush=True); t += s
-    return t
+def show_spinner(stop_event):
+    chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    i = 0
+    while not stop_event.is_set():
+        sys.stdout.write(f"\r {C(chars[i%len(chars)])} {W('thinking')} ")
+        sys.stdout.flush()
+        i += 1
+        time.sleep(0.08)
+    sys.stdout.write("\r" + " " * 20 + "\r")
+    sys.stdout.flush()
 
 def run_sh(cmd):
     try: r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60); return (r.stdout + r.stderr)[:10000]
-    except: return f"Command timed out or failed: {cmd[:80]}"
+    except: return ""
 
 def fuzzy_files(q, limit=10):
     ql = q.lower()
     res = []
     for root, dirs, files in os.walk("."):
         dn = os.path.basename(root)
-        if dn.startswith(".") or dn == "__pycache__" or dn == "node_modules": continue
+        if dn.startswith(".") or dn in ("__pycache__","node_modules"): continue
         for f in files:
             fp = os.path.join(root, f)
             if ql in fp.lower() or ql in f.lower():
@@ -131,7 +161,7 @@ def search_grep(pattern, path="."):
         return [f for f in r.stdout.strip().split("\n") if f][:30]
     except: return []
 
-def save_blocks(text, cwd="."):
+def save_blocks(text):
     saved = []
     for lang, code in re.findall(r'```(\w*)\n(.*?)```', text, re.DOTALL):
         code = code.strip()
@@ -171,100 +201,80 @@ def save_sessions(data):
         with open(SESSION_FILE, "w") as f: json.dump(data, f)
     except: pass
 
-def model_tag(name):
-    if name.startswith("Sol"): return "Sol"
-    if name.startswith("DS"): return "DS"
-    if "Llama" in name: return "L4"
-    if "Nem" in name: return "Nem"
-    return "?"
-
 def model_color(name):
-    if name.startswith("Sol"): return G
     if "Pro" in name: return C
-    if "Flash" in name: return BL
+    if "Mav" in name: return G
+    if "S49" in name: return BL
+    if "Reason" in name: return W
     return W
 
-def header_line(bl=""):
-    cols = shutil.get_terminal_size().columns
-    line = f" {C('◆')} {B('ProCode')}  {G('Sol Pro')}{D('→DS VP→DS VF→L4→Nem')}  {D('│')}  {bl}"
-    return line[:cols]
+def model_icon(name):
+    if "Pro" in name: return "\u25c6"
+    if "Mav" in name: return "\u25b6"
+    if "S49" in name: return "\u25a0"
+    if "Reason" in name: return "\u25cb"
+    return "\u25cf"
 
 def cmd_read(args):
     c = file_content(args)
     if c is not None:
-        fn = os.path.basename(args)
-        _, ext = os.path.splitext(fn)
+        _, ext = os.path.splitext(args)
         lang = ext.lstrip(".") if ext else ""
-        print(f"\n{D(f'── {args} ')}{D('─' * max(2, shutil.get_terminal_size().columns - len(args) - 8))}")
-        if lang in ("py","js","ts","go","rs","java","c","cpp","h","hpp","css","html","xml","json","yaml","yml","toml","sh","bash","zsh","sql","md","rb","php","swift","kt"):
+        total = len(c)
+        lines = c.count("\n") + 1
+        print(f"\n{D('\u2500' * 4)} {W(args)} {D(f'{lines}L {total}B')} {D('\u2500' * max(2, shutil.get_terminal_size().columns - len(args) - 20))}")
+        if lang in ("py","js","ts","go","rs","java","c","cpp","h","css","html","xml","json","yaml","yml","toml","sh","bash","md","rb","php","swift","kt","sql"):
             print(f"```{lang}\n{c}\n```")
         else:
             print(c)
     else:
-        print(f" {R('✗')} File not found: {args}")
+        print(f" {R('\u2717')} File not found: {args}")
 
 def cmd_write(args):
     parts = args.split(None, 1)
-    if not parts:
-        print(f" {R('✗')} Usage: /write <file> <content>"); return
+    if not parts: print(f" {R('\u2717')} /write <file> <content>"); return
     fpath = os.path.expanduser(parts[0])
     content = parts[1] if len(parts) > 1 else ""
     os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
     try:
         with open(fpath, "w") as f: f.write(content)
-        sz = len(content)
-        print(f" {G('✓')} Wrote {fpath}  {W(f'({sz}B)')}")
-    except Exception as e:
-        print(f" {R('✗')} {e}")
+        print(f" {G('\u2713')} {W(os.path.basename(fpath))}  {D(f'{len(content)}B')}")
+    except Exception as e: print(f" {R('\u2717')} {e}")
 
 def cmd_edit(args):
     parts = args.split(None, 1)
-    if not parts:
-        print(f" {R('✗')} Usage: /edit <file> <new content>"); return
+    if not parts: print(f" {R('\u2717')} /edit <file> <content>"); return
     fpath = os.path.expanduser(parts[0])
-    if not os.path.exists(fpath):
-        cmd_write(args); return
+    if not os.path.exists(fpath): cmd_write(args); return
     old = open(fpath).read()
     new = parts[1] if len(parts) > 1 else ""
     try:
         with open(fpath, "w") as f: f.write(new)
-        lines_o, lines_n = old.count("\n"), new.count("\n")
-        print(f" {G('✓')} Updated {fpath}  {W(f'{lines_o}→{lines_n} lines')}")
-    except Exception as e:
-        print(f" {R('✗')} {e}")
+        lo, ln = old.count("\n")+1, new.count("\n")+1
+        print(f" {G('\u2713')} {W(os.path.basename(fpath))}  {D(f'{lo}\u2192{ln}L')}")
+    except Exception as e: print(f" {R('\u2717')} {e}")
 
 def cmd_diff(args):
-    if not args:
-        print(f" {R('✗')} Usage: /diff <file>"); return
+    if not args: print(f" {R('\u2717')} /diff <file>"); return
     fpath = os.path.expanduser(args)
-    if not os.path.exists(fpath):
-        print(f" {R('✗')} Not found: {fpath}"); return
-    try:
-        r = subprocess.run(f"git diff --stat HEAD -- '{fpath}' 2>/dev/null || echo 'NOT A GIT REPO'", shell=True, capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            subprocess.run(f"git diff HEAD -- '{fpath}' | head -80", shell=True)
-        else:
-            print(f" {Y('·')} No git diff available for {fpath}")
-    except: pass
+    if not os.path.exists(fpath): print(f" {R('\u2717')} Not found"); return
+    r = subprocess.run(f"git diff --stat HEAD -- '{fpath}' 2>/dev/null || echo 'NOGIT'", shell=True, capture_output=True, text=True, timeout=5)
+    if r.returncode == 0 and r.stdout.strip() and "NOGIT" not in r.stdout:
+        subprocess.run(f"git diff HEAD -- '{fpath}' | head -80", shell=True)
+    else:
+        print(f" {Y('\u00b7')} No diff available")
 
 def cmd_status():
-    try:
-        r = subprocess.run("git status --short 2>/dev/null || echo 'NOT A GIT REPO'", shell=True, capture_output=True, text=True, timeout=5)
-        if "NOT A GIT REPO" in r.stdout:
-            print(f" {Y('·')} Not a git repository")
-        elif r.stdout.strip():
-            print(f" {C('git status')}")
-            print(r.stdout.strip())
-        else:
-            print(f" {G('✓')} Clean working tree")
-    except: pass
+    r = subprocess.run("git status --short 2>/dev/null || echo 'NOGIT'", shell=True, capture_output=True, text=True, timeout=5)
+    out = r.stdout.strip()
+    if "NOGIT" in out: print(f" {Y('\u00b7')} Not a git repo")
+    elif out: print(f" {C('\u2387')} {out}")
+    else: print(f" {G('\u2713')} Clean tree")
 
 def cmd_undo(msgs):
-    if len(msgs) < 2:
-        print(f" {Y('-')} Nothing to undo"); return
-    removed_user = msgs.pop()
-    removed_asst = msgs.pop()
-    print(f" {G('✓')} Undid last exchange")
+    if len(msgs) < 2: print(f" {Y('-')} Nothing to undo"); return
+    msgs.pop(); msgs.pop()
+    print(f" {G('\u2713')} Undone")
 
 def cmd_export(msgs):
     path = os.path.join(DATA_DIR, f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
@@ -275,56 +285,69 @@ def cmd_export(msgs):
                 if m["role"] == "system": continue
                 label = "You" if m["role"] == "user" else "ProCode"
                 f.write(f"**{label}:**\n{m['content']}\n\n")
-        print(f" {G('✓')} Exported {W(f'({len(msgs)} msgs)')} → {os.path.basename(path)}")
-    except Exception as e:
-        print(f" {R('✗')} {e}")
+        print(f" {G('\u2713')} Exported  {W(f'{len(msgs)} msgs')}  {D(f'\u2192 {os.path.basename(path)}')}")
+    except Exception as e: print(f" {R('\u2717')} {e}")
+
+def cmd_stats():
+    t = _session_tokens
+    print(f" {B('Session Stats')}")
+    tp, tc, tt = t["prompt"], t["completion"], t["total"]
+    print(f"  {W('Tokens:')}    {D('prompt')} {tp:>6}  {D('completion')} {tc:>6}  {D('total')} {tt:>6}")
+    print(f"  {W('Budget:')}    ${_usage:.4f} used  {D(f'({_usage/1.0*100:.1f}%)')}")
+    if _last_response_time:
+        print(f"  {W('Last:')}     {_last_model_name}  {D(f'{_last_response_time:.1f}s')}")
 
 def cmd_help():
     cols = shutil.get_terminal_size().columns
-    print(f" {C('ProCode')} {W('- AI coding agent')}  {D(f'v2.0')}")
+    print(f" {C('ProCode')} {W('- Free AI coding agent')}  {D('v3.0')}")
     print()
     print(f" {B('Commands')}")
-    print(f"  /help               {W('Show this help')}")
-    print(f"  /clear              {W('Clear screen')}")
-    print(f"  /read <file>        {W('Read a file with syntax highlighting')}")
-    print(f"  /write <file> <c>   {W('Write content to file')}")
-    print(f"  /edit <file> <c>    {W('Edit existing file')}")
-    print(f"  /diff <file>        {W('Show git diff for file')}")
-    print(f"  /status             {W('Show git status')}")
-    print(f"  /sh <cmd>           {W('Run shell command')}")
-    print(f"  /grep <q>           {W('Search file contents')}")
-    print(f"  /glob <p>           {W('Find files by glob pattern')}")
-    print(f"  /undo               {W('Undo last AI exchange')}")
-    print(f"  /export             {W('Export session to markdown')}")
-    print(f"  /budget             {W('Show credit usage')}")
-    print(f"  /models             {W('List available models')}")
-    print(f"  /sessions           {W('List saved sessions')}")
-    print(f"  /save <name>        {W('Save current session')}")
-    print(f"  /load <name>        {W('Load a saved session')}")
+    cmds = [
+        ("/help", "Show this help"),
+        ("/clear", "Clear screen"),
+        ("/read <file>", "Read file with syntax highlight"),
+        ("/write <file> <c>", "Write content to file"),
+        ("/edit <file> <c>", "Edit existing file"),
+        ("/diff <file>", "Show git diff"),
+        ("/status", "Git working tree status"),
+        ("/sh <cmd>", "Run shell command"),
+        ("/grep <q>", "Search file contents"),
+        ("/glob <p>", "Find files by pattern"),
+        ("/undo", "Undo last AI exchange"),
+        ("/export", "Export session to markdown"),
+        ("/stats", "Session token & budget stats"),
+        ("/models", "List model chain"),
+        ("/sessions", "List saved sessions"),
+        ("/save <name>", "Save current session"),
+        ("/load <name>", "Load a saved session"),
+    ]
+    for cmd, desc in cmds:
+        print(f"  {C(cmd):20s} {W(desc)}")
     print()
     print(f" {B('Features')}")
-    print(f"  @<pattern>          {W('Fuzzy attach file to message')}")
-    print(f"  !<command>          {W('Run shell command inline')}")
-    print(f"  exit / quit         {W('Exit ProCode')}")
+    print(f"  {G('@<pattern>')}      {W('Fuzzy attach file to message')}")
+    print(f"  {G('!<command>')}      {W('Run shell command inline')}")
+    print(f"  {C('exit')} / {C('quit')}    {W('Exit ProCode')}")
     print()
-    print(f" {B('Model Chain')}")
-    print(f"  {G('Sol Pro')}  {W('→')}  {C('DS V4 Pro')}  {W('→')}  {BL('DS V4 Flash')}  {W('→')}  {W('Llama4 Mav')}  {W('→')}  {W('Nem S49')}  {W('→')}  {W('Nem Reason')}")
-    print(f"  {D('OpenRouter → NVIDIA → NVIDIA → NVIDIA → NVIDIA → OpenRouter (free)')}")
+    print(f" {B('Model Chain')}  {D('(all free, auto-switch)')}")
+    print(f"  {C('\u25c6')} DS V4 Pro  {D('\u2192')}  {G('\u25b6')} Llama4 Mav  {D('\u2192')}  {BL('\u25a0')} Nem S49  {D('\u2192')}  {W('\u25cb')} Nem Reason")
+    print(f"  {D('NVIDIA \u2192 NVIDIA \u2192 NVIDIA \u2192 OpenRouter')}")
 
 def cmd_models():
-    print(f"\n {B('Model Chain')}\n")
-    seen = set()
-    tier = 1
-    for n, k, b, m, mt, _, to in PROVIDERS_RAW:
-        tag = model_tag(n)
-        api = "OR" if b == OR_BASE else "NV"
-        cost = "free" if "free" in m else (r"$5+" if "sol" in m.lower() else "paid")
-        prefix = f"T{tier}"
-        print(f"  {model_color(n)('●')} {n:15s} {W(f'({m[:45]})')}  {D(f'{api} {to}s {cost}')}")
-        if m not in seen:
-            seen.add(m)
-            tier += 1
-    print(f"\n  {D(f'{len(PROVIDERS_RAW)} routes • {len(seen)} models • 6 tiers')}\n")
+    print(f"\n {B('Free Model Chain')}\n")
+    tiers = [("1. DS V4 Pro", C, "deepseek-ai/deepseek-v4-pro", "NVIDIA", "Best coding"),
+             ("2. Llama4 Mav", G, "meta/llama-4-maverick-17b-128e-instruct", "NVIDIA", "Fast, 3s"),
+             ("3. Nemotron S49", BL, "nvidia/llama-3.3-nemotron-super-49b-v1", "NVIDIA", "Deep fallback"),
+             ("4. Nem Reason", W, "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "OpenRouter", "Free, reasoning")]
+    for label, color, model, api, note in tiers:
+        print(f"  {color('\u25c9')} {label:18s} {W(f'{model[:50]}')}")
+        print(f"  {' ' * 22} {D(f'{api} \u00b7 {note}')}")
+        print()
+    print(f"  {D(f'5 routes \u00b7 4 models \u00b7 0 cost')}")
+    t = _session_tokens
+    tpt, tct, ttt = t["prompt"], t["completion"], t["total"]
+    print(f"  {D(f'Tokens: {ttt} total ({tpt} prompt + {tct} completion)')}")
+    print()
 
 def main():
     cwd = os.getcwd()
@@ -341,17 +364,19 @@ def main():
     else:
         msgs = [{"role": "system", "content": f"{SYSTEM}\nCWD: {cwd}"}]
 
+    global _session_tokens
+    if active_name and active_name in session_list:
+        st = session_list[active_name].get("tokens", {})
+        _session_tokens = {"prompt": st.get("prompt",0), "completion": st.get("completion",0), "total": st.get("total",0)}
+
     last_model = None
     try: readline.read_history_file(HIST_FILE)
     except: pass
 
-    # One-shot mode
     if len(sys.argv) > 1:
         p = " ".join(sys.argv[1:])
-        if p.startswith("/sh "):
-            print(run_sh(p[4:]))
-        elif p.startswith("/read "):
-            cmd_read(p[6:])
+        if p.startswith("/sh "): print(run_sh(p[4:]))
+        elif p.startswith("/read "): cmd_read(p[6:])
         elif p.startswith("/grep "):
             for f in search_grep(p[6:]): print(f)
         elif p.startswith("/glob "):
@@ -359,34 +384,37 @@ def main():
                 if os.path.isfile(f): print(f)
         else:
             msgs.append({"role": "user", "content": p})
-            r, m = send(msgs)
-            if r:
-                f = stream_out(r); print()
-                for s in save_blocks(f): print(f" {G('✓')} {os.path.basename(s)}")
+            spinner_stop = threading.Event()
+            spinner = threading.Thread(target=show_spinner, args=(spinner_stop,))
+            spinner.start()
+            content, model = send(msgs)
+            spinner_stop.set()
+            spinner.join()
+            if content:
+                print(content)
+                saved = save_blocks(content)
+                if saved:
+                    for s in saved: print(f" {G('\u2713')} {os.path.basename(s)}")
+                msgs.append({"role": "assistant", "content": content})
         return
 
     os.system('clear')
-    bl = budget_line()
-    print(header_line(bl))
+    print(header())
     print()
 
     while True:
-        try: inp = input(f" {C('▸')} ").strip()
+        try: inp = input(f" {C('\u25b8')} ").strip()
         except: print(); break
         if not inp: continue
 
         if inp in ("exit", "quit", "/q"): print(); break
         if inp == "/clear":
             os.system('clear')
-            bl = budget_line()
-            print(header_line(bl))
+            print(header())
             print()
             continue
         if inp == "/help": cmd_help(); continue
-        if inp == "/budget":
-            refresh_budget()
-            print(f" {budget_line()}  {W(f'${_usage:.4f} used')}")
-            continue
+        if inp == "/stats": cmd_stats(); continue
         if inp == "/models": cmd_models(); continue
         if inp == "/undo": cmd_undo(msgs); continue
         if inp == "/export": cmd_export(msgs); continue
@@ -395,32 +423,35 @@ def main():
         if inp.startswith("/write "): cmd_write(inp[7:]); continue
         if inp.startswith("/edit "): cmd_edit(inp[6:]); continue
         if inp.startswith("/diff "): cmd_diff(inp[6:]); continue
-        if inp.startswith("/sh "):
-            print(run_sh(inp[4:])); continue
+        if inp.startswith("/sh "): print(run_sh(inp[4:])); continue
         if inp.startswith("/grep "):
-            for f in search_grep(inp[6:]): print(f" {D('·')} {f}")
+            for f in search_grep(inp[6:]): print(f" {D('\u00b7')} {f}")
             continue
         if inp.startswith("/glob "):
             for f in gb.glob(inp[6:], recursive=True)[:20]:
-                if os.path.isfile(f): print(f" {D('·')} {f}")
+                if os.path.isfile(f): print(f" {D('\u00b7')} {f}")
             continue
         if inp.startswith("/save "):
             name = inp[6:].strip()
             if not name: name = f"session_{len(session_list)+1}"
-            session_list[name] = {"msgs": msgs.copy(), "time": time.time()}
+            data = {"msgs": msgs.copy(), "time": time.time(), "tokens": _session_tokens.copy()}
+            session_list[name] = data
             sessions["sessions"] = session_list
             sessions["active"] = name
             save_sessions(sessions)
-            print(f" {G('✓')} Saved '{name}'  {W(f'({len(msgs)} msgs)')}")
+            stok = _session_tokens["total"]
+            print(f" {G('\u2713')} Saved '{name}'  {W(f'{len(msgs)} msgs, {stok} tok')}")
             continue
         if inp.startswith("/load "):
             name = inp[6:].strip()
             if name in session_list:
                 msgs = session_list[name]["msgs"]
                 sessions["active"] = name
+                st = session_list[name].get("tokens", {})
+                _session_tokens = {"prompt": st.get("prompt",0), "completion": st.get("completion",0), "total": st.get("total",0)}
                 save_sessions(sessions)
-                print(f" {G('✓')} Loaded '{name}'  {W(f'({len(msgs)} msgs)')}")
-            else: print(f" {R('✗')} Session '{name}' not found")
+                print(f" {G('\u2713')} Loaded '{name}'  {W(f'{len(msgs)} msgs')}")
+            else: print(f" {R('\u2717')} Session '{name}' not found")
             continue
         if inp == "/sessions":
             if not session_list: print(f" {Y('-')} No saved sessions")
@@ -428,34 +459,26 @@ def main():
                 for name, s in session_list.items():
                     age = ""
                     if "time" in s:
-                        diff_m = int((time.time() - s["time"]) / 60)
-                        if diff_m < 1: age = "just now"
-                        elif diff_m < 60: age = f"{diff_m}m ago"
-                        else: age = f"{diff_m//60}h ago"
-                    mcnt = len(s["msgs"]); print(f"  {G('\u25cf')} {name:20s} {D(f'{mcnt} msgs')} {W(age)}")
+                        dm = int((time.time()-s["time"])/60)
+                        age = "just now" if dm < 1 else f"{dm}m ago" if dm < 60 else f"{dm//60}h ago"
+                    tok = s.get("tokens",{}).get("total",0)
+                    scnt = len(s["msgs"])
+                    print(f"  {G('\u25c9')} {name:20s} {D(f'{scnt} msgs')} {W(f'{tok}tok')}  {D(age)}")
             continue
 
-        # Handle @file attachments
         at_match = re.search(r'@(\S+)', inp)
         if at_match:
-            q = at_match.group(1)
-            files = fuzzy_files(q, limit=5)
-            if files: attachment = files[0]
-            else: attachment = None
-            if attachment:
-                fc = file_content(attachment)
+            files = fuzzy_files(at_match.group(1), limit=5)
+            if files:
+                fc = file_content(files[0])
                 if fc:
-                    ext = os.path.splitext(attachment)[1].lstrip(".")
-                    inp = inp.replace(at_match.group(0), "")
-                    inp = f"See attached file `{attachment}`:\n```{ext}\n{fc}\n```\n{inp}"
-                    print(f" {D('@')} {attachment}")
+                    inp = inp.replace(at_match.group(0), "") + f"\n```\n{fc}\n```"
+                    print(f" {D('@')} {files[0]}")
 
-        # Handle !commands
         if inp.startswith("!"):
             out = run_sh(inp[1:])
             inp = f"$ {inp[1:]}\n{out}"
 
-        # Process inline /read and /sh
         inp_proc = re.sub(r'/read\s+(\S+)', lambda m: (
             f"\n```\n{open(os.path.expanduser(m.group(1))).read()}\n```\n"
             if os.path.exists(os.path.expanduser(m.group(1))) else m.group(0)
@@ -463,32 +486,40 @@ def main():
         inp_proc = re.sub(r'/sh\s+(.*)', lambda m: f"\n$ {m.group(1)}\n{run_sh(m.group(1))}\n", inp_proc)
 
         msgs.append({"role": "user", "content": inp_proc})
-        r, m = send(msgs)
-        if not r:
-            print(f" {R('✗')} No model responded")
+
+        spinner_stop = threading.Event()
+        spinner = threading.Thread(target=show_spinner, args=(spinner_stop,))
+        spinner.start()
+        content, model = send(msgs)
+        spinner_stop.set()
+        spinner.join()
+
+        if not content:
+            print(f" {R('\u2717')} No model available")
             msgs.pop()
             continue
 
-        if m != last_model:
-            print(f" {model_color(m)(f'[{m}]')}")
-            last_model = m
-        f = stream_out(r); print()
-        msgs.append({"role": "assistant", "content": f})
+        if model != last_model:
+            icon = model_icon(model)
+            print(f" {model_color(model)(f'{icon} [{model}]')}  {D(f'{_last_response_time:.1f}s')}")
+            last_model = model
 
-        saved = save_blocks(f)
+        print(content)
+        msgs.append({"role": "assistant", "content": content})
+
+        saved = save_blocks(content)
         if saved:
             names = [os.path.basename(s) for s in saved]
-            print(f" {D('─')} {G(', '.join(names))}")
+            print(f" {D('\u2500')} {G(', '.join(names))}")
 
-        # Auto-save latest session
-        session_list["_latest"] = {"msgs": msgs.copy(), "time": time.time()}
+        session_list["_latest"] = {"msgs": msgs.copy(), "time": time.time(), "tokens": _session_tokens.copy()}
         sessions["sessions"] = session_list
         save_sessions(sessions)
 
     try:
         readline.write_history_file(HIST_FILE)
         if len(msgs) > 1:
-            session_list["_latest"] = {"msgs": msgs.copy(), "time": time.time()}
+            session_list["_latest"] = {"msgs": msgs.copy(), "time": time.time(), "tokens": _session_tokens.copy()}
             sessions["sessions"] = session_list
             save_sessions(sessions)
     except: pass
