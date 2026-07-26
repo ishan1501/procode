@@ -24,21 +24,20 @@ OR_BASE = _cfg.get("or_base", "https://openrouter.ai/api/v1")
 NV_BASE = _cfg.get("nv_base", "https://integrate.api.nvidia.com/v1")
 
 PROVIDERS_RAW = [
-    ("Sol Pro OpenAI",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI"],"allow_fallbacks":False}}),
-    ("Sol Pro Azure",    OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure"],"allow_fallbacks":False}}),
-    ("Sol Pro AzureEU",  OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure","Azure (EU)"]}}),
-    ("Sol Pro Balanced", OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI","Azure"]}}),
-    ("Sol Pro Nitro",    OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {}),
-    ("Sol Pro Exacto",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {}),
-    ("Sol Pro ONitro",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI"]}}),
-    ("Sol Pro ANitro",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure"]}}),
-    ("DS V4 Pro 1", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}),
-    ("DS V4 Pro 2", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}),
-    ("DS V4 Pro 3", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}),
-    ("DS V4 Flash", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-flash", 16384, {}),
+    # Tier 1: Sol Pro (needs $5+ OR credits, 3s timeout)
+    ("Sol Pro OpenAI",   OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI"],"allow_fallbacks":False}}, 3),
+    ("Sol Pro Azure",    OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["Azure"],"allow_fallbacks":False}}, 3),
+    ("Sol Pro Balanced", OR_KEY, OR_BASE, "openai/gpt-5.6-sol-pro", 4096, {"provider":{"order":["OpenAI","Azure","AWS"]}}, 3),
+    # Tier 2: DeepSeek V4 Pro (unlimited via NVIDIA, top-tier coding)
+    ("DS V4 Pro",   NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}, 30),
+    ("DS V4 Pro 2", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-pro", 16384, {}, 30),
+    # Tier 3: DeepSeek V4 Flash (fast, cheap, 1M context)
+    ("DS V4 Flash", NV_KEY, NV_BASE, "deepseek-ai/deepseek-v4-flash", 16384, {}, 30),
+    # Tier 4: Free OR models (zero cost fallbacks)
+    ("Nemotron Reason", OR_KEY, OR_BASE, "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", 8192, {}, 15),
 ]
 CLIENTS = {}
-for n, k, b, _, _, _ in PROVIDERS_RAW:
+for n, k, b, _, _, _, _ in PROVIDERS_RAW:
     try: CLIENTS[n] = OpenAI(api_key=k, base_url=b)
     except: pass
 
@@ -85,7 +84,7 @@ def call_api(name, msgs, max_tok=4096):
     kw = {"model": p[3], "messages": msgs, "max_tokens": min(max_tok, p[4]), "stream": True,
           "extra_headers": {"HTTP-Referer":"https://procode.ai","X-Title":"ProCode"}}
     if p[5]: kw["extra_body"] = p[5]
-    try: return c.chat.completions.create(**kw, timeout=3 if name.startswith("Sol") else 30)
+    try: return c.chat.completions.create(**kw, timeout=p[6])
     except: return None
 
 def send(msgs):
@@ -156,7 +155,7 @@ def save_blocks(text, cwd="."):
 def load_sessions():
     try:
         with open(SESSION_FILE) as f: return json.load(f)
-    except: return {"sessions": [], "active": None}
+    except: return {"sessions": {}, "active": None}
 
 def save_sessions(data):
     with open(SESSION_FILE, "w") as f: json.dump(data, f)
@@ -269,10 +268,10 @@ def cmd_help():
 def cmd_models():
     print(f"\n {BO('Available Models')}\n")
     seen = set()
-    for n, k, b, m, mt, _ in PROVIDERS_RAW:
-        prefix = "Sol" if n.startswith("Sol") else "DS "
+    for n, k, b, m, mt, _, to in PROVIDERS_RAW:
+        tag = {"Sol":"Sol","DS ":"DS","Nem":"Free","Dee":"DS"}.get(n[:3],"?")
         if m not in seen:
-            print(f"  {G('●') if prefix == 'Sol' else C('●')} {n}  {D(f'({m})')}")
+            print(f"  {G('●') if tag == 'Sol' else C('●')} {n}  {D(f'({m})')}  {D(f'{to}s')}")
             seen.add(m)
     print(f"\n {D(f'{len(PROVIDERS_RAW)} routes across {len(seen)} models')}\n")
 
@@ -281,6 +280,10 @@ def main():
     sessions = load_sessions()
     active_name = sessions.get("active")
     session_list = sessions.get("sessions", {})
+
+    if isinstance(session_list, list):
+        session_list = {}
+        sessions["sessions"] = session_list
 
     if active_name and active_name in session_list:
         msgs = session_list[active_name]["msgs"]
